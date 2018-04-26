@@ -1,0 +1,2 @@
+model_checkpoint_path: "/home/barakat/Desktop/tf_self_framework/utils/ckpts/convnet"
+all_model_checkpoint_paths: "/home/barakat/Desktop/tf_self_framework/utils/ckpts/convnet"
