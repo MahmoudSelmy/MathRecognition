@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 import sys
 import math
+import os
 
 
 def _find_image_files(data_dir, labels_file, split_ratio=(0.90, 0.05, 0.05)):
@@ -161,7 +162,10 @@ def batch_from_tfrecord(data_path, height, width, sess, rgb=True, num_epochs=1, 
                'record/label': tf.FixedLenFeature([], tf.int64)}
 
     # Create a list of filenames and pass it to a queue
-    filename_queue = tf.train.string_input_producer([data_path], num_epochs)
+    if num_epochs is None:
+        filename_queue = tf.train.string_input_producer([data_path])
+    else:
+        filename_queue = tf.train.string_input_producer([data_path], num_epochs)
 
     # Define a reader and read the next record
     reader = tf.TFRecordReader()
@@ -172,11 +176,11 @@ def batch_from_tfrecord(data_path, height, width, sess, rgb=True, num_epochs=1, 
 
     # Convert the image data from string back to the numbers
     image = tf.decode_raw(features['record/image'], tf.float32)
-    print(image)
+    #print(image)
 
     # Cast label data into int32
     label = tf.cast(features['record/label'], tf.int32)
-    print(label)
+    #print(label)
 
     # Reshape image data into the original shape
     if rgb:
@@ -190,15 +194,7 @@ def batch_from_tfrecord(data_path, height, width, sess, rgb=True, num_epochs=1, 
     images, labels = tf.train.shuffle_batch([image, label], batch_size=batch_size, capacity=capacity,
                                             num_threads=num_threads, min_after_dequeue=min_after_dequeue)
 
-    # Initialize all global and local variables
-    init_op = tf.group(tf.global_variables_initializer(), tf.local_variables_initializer())
-    sess.run(init_op)
-
-    # Create a coordinator and run all QueueRunner objects
-    coord = tf.train.Coordinator()
-    threads = tf.train.start_queue_runners(sess=sess, coord=coord)
-
-    return coord, threads, images, labels
+    return  images, labels
 
 
 
@@ -222,7 +218,7 @@ def max_pool_2x2(x):
                           strides=[1, 2, 2, 1], padding='SAME')
 
 
-def inference(x, keep_prob):
+def inference(x):
     W_conv1 = weight_variable([5, 5, 1, 32], 0.1, "W_conv1")
     b_conv1 = bias_variable([32], "b_conv1")
     h_conv1 = tf.nn.relu(conv2d(x, W_conv1) + b_conv1)
@@ -233,21 +229,22 @@ def inference(x, keep_prob):
     h_conv2 = tf.nn.relu(conv2d(h_pool1, W_conv2) + b_conv2)
     h_pool2 = max_pool_2x2(h_conv2)
 
-    W_fc1 = weight_variable([7 * 7 * 64, 1024], 0.1, "W_fc1")
+
+    W_fc1 = weight_variable([12 * 12 * 64, 1024], 0.1, "W_fc1")
     b_fc1 = bias_variable([1024], "b_fc1")
-    h_pool2_flat = tf.reshape(h_pool2, [-1, 7 * 7 * 64])
+    h_pool2_flat = tf.reshape(h_pool2, [-1, 12 * 12 * 64])
     h_fc1 = tf.nn.relu(tf.matmul(h_pool2_flat, W_fc1) + b_fc1)
-    h_fc1_drop = tf.nn.dropout(h_fc1, keep_prob)
+
 
     W_fc2 = weight_variable([1024,25], 0.1, "W_fc2")
     b_fc2 = bias_variable([25], "b_fc2")
-    softmax_linear = tf.add(tf.matmul(h_fc1_drop, W_fc2), b_fc2)
+    softmax_linear = tf.add(tf.matmul(h_fc1, W_fc2), b_fc2)
 
     return softmax_linear
 
 
 def loss(logits, labels):
-    cross_entropy = tf.nn.softmax_cross_entropy_with_logits(logits, labels)
+    cross_entropy = tf.nn.softmax_cross_entropy_with_logits(logits=logits, labels=labels)
     cross_entropy_mean = tf.reduce_mean(cross_entropy)
     tf.add_to_collection('losses', cross_entropy_mean)
 
@@ -257,109 +254,105 @@ def loss(logits, labels):
 
 
 def training(loss):
-    train_step = tf.train.AdamOptimizer(1e-3).minimize(loss)
+    train_step = tf.train.AdamOptimizer(1e-4).minimize(loss)
 
     return train_step
 
 
 def evaluation(logits, y_):
     correct_prediction = tf.equal(tf.argmax(logits, 1), tf.argmax(y_, 1))
-    accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
+    accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32)) * 100
 
     return accuracy
 
 
-def load_model(save_path):
-    class Convnet:
-        def __init__(self):
-            self.x = tf.placeholder(tf.float32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, 1])
-            logits = inference(self.x, 1.0)
-            self.recognize = tf.argmax(logits, 1)
-
-            saver = tf.train.Saver()
-            self.sess = tf.Session()
-            saver.restore(self.sess, save_path)
-
-        def predict(self, images):
-            """
-            images: [N, IMAGE_SIZE * IMAGE_SIZE]
-            """
-            images = images.reshape(-1, IMAGE_SIZE, IMAGE_SIZE, 1)
-            return self.sess.run(self.recognize, feed_dict={self.x: images})
-
-        def save_final(self, path):
-            saver = tf.train.Saver()
-            saver.save(sess, path)
-            print("Final Model saved in file: %s" % path)
-
-    return Convnet()
 
 
-def train(num_epochs, batch_size):
+
+def train(num_epochs, batch_size, model_path=None):
     sess = tf.Session()
-    coord, threads, images, labels = batch_from_tfrecord("training.tfrecords", 45, 45, sess, rgb=False, num_epochs=num_epochs,
-                                                         batch_size=batch_size, capacity=500, num_threads=1, min_after_dequeue=50)
+    no_training_examples = sum(1 for _ in tf.python_io.tf_record_iterator("training.tfrecords"))
+    print("training set has:", no_training_examples, "examples")
 
-    coord_val , threads_val , images_val, labels_val = batch_from_tfrecord("validation.tfrecords", 45, 45, sess, rgb=False,
+    images, labels = batch_from_tfrecord("training.tfrecords", 45, 45, sess, rgb=False, num_epochs=None,
+                                                         batch_size=batch_size, capacity=1000, num_threads=1, min_after_dequeue=50)
+
+    images_val, labels_val = batch_from_tfrecord("validation.tfrecords", 45, 45, sess, rgb=False,
                                                          num_epochs=None,
-                                                         batch_size=batch_size*2, capacity=500, num_threads=1,
+                                                         batch_size=batch_size*10, capacity=10000, num_threads=1,
                                                          min_after_dequeue=50)
 
     ######################################################
     x = tf.placeholder(tf.float32, shape=[None, 45, 45, 1])
     y_ = tf.placeholder(tf.float32, shape=[None, 25])
-    keep_prob = tf.placeholder(tf.float32)
 
-    logits = inference(x, keep_prob)
+
+
+
+    logits = inference(x)
     losses = loss(logits, y_)
     train_step = training(losses)
     accuracy = evaluation(logits, y_)
 
+    # Initialize all global and local variables
+    init_op = tf.group(tf.global_variables_initializer(), tf.local_variables_initializer())
+    sess.run(init_op)
+
+    # Create a coordinator and run all QueueRunner objects
+    coord = tf.train.Coordinator()
+    threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+
     saver = tf.train.Saver()
 
-    sess.run(tf.initialize_all_variables())     # or load prviously saved weigths
-
-
+    if model_path is None:
+        sess.run(tf.initialize_all_variables())
+    else:
+        saver.restore(sess, model_path)
 
 
     batch_index = 0
-    test_accuracy = 0.0
+    prev_test_accuracy = 0.0
     print("/////////////////////////////////////////////////////////")
 
     try:
-        while True:
-            batch_index += 1
+        for epoch in range(1,num_epochs+1):
+            for batches in range(int(no_training_examples/batch_size)):
+                batch_index += 1
 
-            img, lbl = sess.run([images, labels])
-            img = img.astype(np.uint8)
-
-            _, training_accuracy = sess.run([train_step,accuracy], feed_dict={x: img, y_: lbl, keep_prob: 0.5})
-
-            print("batch number: %d training_accuracy : %d"%(batch_index,training_accuracy))
-
-            if batch_index % 25 == 0:
-                img, lbl = sess.run([images_val, labels_val])
+                img, lbl = sess.run([images, labels])
                 img = img.astype(np.uint8)
-                test_accuracy = sess.run(accuracy, feed_dict={x: img, y_: lbl, keep_prob: 1.0})
-                print("##### batch number: %d validation_accuracy : %d" % (batch_index, test_accuracy))
+                lbl = np.eye(25)[[lbl]]
+
+                _, training_accuracy = sess.run([train_step,accuracy], feed_dict={x: img, y_: lbl})
+
+                print("##### batch number:" + str(batch_index), "training_accuracy:" + str(training_accuracy))
+
+                if batch_index % 25 == 0:
+                    img, lbl = sess.run([images_val, labels_val])
+                    img = img.astype(np.uint8)
+                    lbl = np.eye(25)[[lbl]]
+
+                    test_accuracy = sess.run(accuracy, feed_dict={x: img, y_: lbl})
+                    print("##### batch number:" + str(batch_index), "validation_accuracy:" + str(test_accuracy))
 
 
-                if test_accuracy > prev_test_accuracy:
-                    #save here
-                    save_path = saver.save(sess, "models/convnet/convnet.ckpt")
-                    print("Model saved in file: %s" % save_path)
+                    if test_accuracy > prev_test_accuracy:
+                        #save here
+                        save_path = saver.save(sess, save_path="/home/barakat/Desktop/tf_self_framework/utils/ckpts/convnet", write_meta_graph=False)
+                        print("Model saved in file: %s" % save_path)
 
-                prev_test_accuracy = test_accuracy
+                    prev_test_accuracy = test_accuracy
+
+            print("////////////////////////////////////////////")
+            print("End of epoch", epoch, "out of", num_epochs)
+        print("All", num_epochs, "are done")
 
 
-
-    except tf.errors.OutOfRangeError as e:
-        coord.request_stop(e)
     finally:
         coord.request_stop()
         coord.join(threads)
-        coord_val.request_stop()
-        coord_val.join(threads)
+        print("coordinator killed all threads successfully")
+
 
 
 
@@ -369,4 +362,5 @@ def train(num_epochs, batch_size):
 
 
 if __name__ == "__main__":
-    train(10, 8)
+    train(1, 512, model_path="/home/barakat/Desktop/tf_self_framework/utils/ckpts/convnet")
+    #train(1, 512)
